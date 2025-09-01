@@ -1,0 +1,9 @@
+# Example calibration parameters for log-distance path-loss model
+# Adjust these after quick tuning near a known AP.
+rssi_at_1m: -45.0   # dBm @ 1 meter
+path_loss_n: 2.5    # path-loss exponent (2.0 free-space, 2.7–3.5 indoor)
+d0_m: 1.0           # reference distance in meters
+
+# Optional 5 GHz overrides (uncomment to enable):
+# rssi_at_1m_5g: -50.0
+# path_loss_n_5g: 3.0
