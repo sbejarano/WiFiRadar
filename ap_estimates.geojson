@@ -1,0 +1,185 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "3e:8b:76:8f:94:6d",
+        "ssid": null,
+        "last_update": "2025-09-01T03:01:52.545076+00:00",
+        "n_samples": 3,
+        "rmse_m": 52.480746024977265,
+        "last_channel": 1
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "8c:85:80:51:d1:2b",
+        "ssid": null,
+        "last_update": "2025-09-01T03:01:52.546143+00:00",
+        "n_samples": 3,
+        "rmse_m": 49.45019045758304,
+        "last_channel": 1
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "14:21:03:e0:47:5d",
+        "ssid": "TruslowLumos",
+        "last_update": "2025-09-01T03:01:52.548485+00:00",
+        "n_samples": 26,
+        "rmse_m": 34.809999584908645,
+        "last_channel": 2
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "36:21:03:e0:47:5d",
+        "ssid": null,
+        "last_update": "2025-09-01T03:01:52.550149+00:00",
+        "n_samples": 15,
+        "rmse_m": 33.30793258483936,
+        "last_channel": 2
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "a6:09:d0:07:66:1a",
+        "ssid": null,
+        "last_update": "2025-09-01T03:01:52.553661+00:00",
+        "n_samples": 44,
+        "rmse_m": 2.7496654342320612,
+        "last_channel": 3
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "60:e8:5b:cb:5a:b8",
+        "ssid": "ENVOY_049970",
+        "last_update": "2025-09-01T03:01:52.557660+00:00",
+        "n_samples": 57,
+        "rmse_m": 13.3917811836893,
+        "last_channel": 3
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "00:11:32:8c:b7:1b",
+        "ssid": "www.valleyphotomaster.com",
+        "last_update": "2025-09-01T03:01:52.561733+00:00",
+        "n_samples": 54,
+        "rmse_m": 12.722319169838642,
+        "last_channel": 3
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "90:09:d0:07:66:1a",
+        "ssid": "www.valleyphotomaster.com",
+        "last_update": "2025-09-01T03:01:52.565468+00:00",
+        "n_samples": 52,
+        "rmse_m": 2.6276552157670245,
+        "last_channel": 3
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "34:98:b5:a8:e9:6c",
+        "ssid": "NETGEAR91",
+        "last_update": "2025-09-01T03:01:52.566996+00:00",
+        "n_samples": 11,
+        "rmse_m": 46.33085328586205,
+        "last_channel": 2
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          -78.9525001,
+          38.0597817
+        ]
+      },
+      "properties": {
+        "bssid": "16:11:32:8c:b7:1b",
+        "ssid": null,
+        "last_update": "2025-09-01T03:01:52.570083+00:00",
+        "n_samples": 35,
+        "rmse_m": 12.3147902134436,
+        "last_channel": 3
+      }
+    }
+  ]
+}

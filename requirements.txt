@@ -2,5 +2,5 @@ scapy==2.5.0
 gpsd-py3==0.3.0
 paho-mqtt==1.6.1
 numpy==1.26.4
+pyyaml==6.0.2
 matplotlib==3.9.2
-PyYAML==6.0.2
