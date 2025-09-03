@@ -79,3 +79,25 @@ Dev:
 
 ## License
 - For internal experimentation; do not commit secrets or large captures.
+
+## Latest Version Changes
+- Here’s what was added or fixed in the last version:
+### RSSI filtering
+Now you can set a threshold with --rssi-display-min (default -70 dBm).
+Any AP weaker than that won’t be shown in the radar or used for trilateration samples.
+Stronger APs (≥ threshold) are tracked and logged as before.
+Pruning (hide when out of range)
+APs that haven’t been seen for --prune-age seconds (default 20) are hidden from the radar display.
+They are NOT deleted from memory → so when you circle back and see them again, the new data adds to their old samples, improving trilateration.
+### Memory retention
+APs always stay in the internal dictionaries (seen, aps).
+Estimates and samples accumulate over the whole walk/drive session, letting you refine their solved positions when you come at them from different directions.
+GeoJSON + MQTT still publish their last known estimated location even while they’re “off screen.”
+### UI clarity
+Only recent APs are drawn; stale ones disappear after the prune timeout.
+But they’re not lost — they come back into view instantly if detected again.
+## Summary
+✅ Only shows stronger APs (configurable threshold).
+✅ Hides stale APs from the radar after a timeout.
+✅ Keeps all data in memory to improve trilateration when you return.
+✅ Still logs everything to GeoJSON and MQTT.
