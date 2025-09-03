@@ -1,36 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Wi-Fi Radar (walking, 5 dBi omni, channel hop, robust GPS)
-- Sniff 802.11 beacons/probe-responses (monitor mode)
-- GPS via gpsd (lat, lon, alt) with robust "last-good-fix" grace window
-- RSSI -> range (log-distance), incremental trilateration (WLS + Gauss-Newton)
-- MQTT publish per-AP with: BSSID, SSID, RSSI, Channel, Lat, Lon, Alt, RMSE, Samples
-- Live GeoJSON output of AP estimates
-- Optional radar-style live plot (polar); disabled by default for headless
 
-Run with sudo and the venv's interpreter:
-  sudo /path/to/.venv/bin/python3 wifi_radar.py --iface wlan1 --gpsd 127.0.0.1:2947
-"""
-
-import argparse
-import json
-import math
-import os
-import signal
-import sys
-import threading
-import time
+import argparse, json, math, os, signal, sys, threading, time, hashlib
 from collections import defaultdict, deque
 from datetime import datetime, timezone
-import subprocess
 
-import numpy as np
-import yaml
+import numpy as np, yaml
 
-# Optional imports guarded for clear errors
+# optional deps
 try:
-    import gpsd  # gpsd-py3
+    import gpsd
 except Exception:
     gpsd = None
 try:
@@ -43,10 +22,10 @@ try:
 except Exception:
     mqtt = None
 
-EARTH_R = 6371000.0  # meters
+EARTH_R = 6371000.0
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
+def now_iso(): return datetime.now(timezone.utc).isoformat()
+def now_mono(): return time.monotonic()
 
 def latlon_to_xy(lat, lon, lat0, lon0):
     x = math.radians(lon - lon0) * EARTH_R * math.cos(math.radians(lat0))
@@ -59,262 +38,200 @@ def xy_to_latlon(x, y, lat0, lon0):
     return lat, lon
 
 def rssi_to_distance(rssi_dbm, rssi_at_1m=-45.0, path_loss_n=2.5, d0=1.0):
-    # Log-distance path-loss
+    if rssi_dbm is None:
+        return None
     return float(d0 * (10 ** ((rssi_at_1m - rssi_dbm) / (10.0 * path_loss_n))))
 
 def robust_weight(distance_m, rssi_dbm):
+    if distance_m is None or rssi_dbm is None:
+        return 0.0
     d = max(1.0, distance_m)
-    rssi_quality = max(0.1, (rssi_dbm + 95.0) / 30.0)
+    rssi_quality = max(0.1, (rssi_dbm + 95.0) / 30.0)  # ~[-95..-65] → [0..1]
     sigma = 0.15 * d / rssi_quality
     return 1.0 / (sigma * sigma)
 
 def wls_trilaterate_2d(points):
-    if len(points) < 3:
+    pts = [p for p in points if p["d"] is not None and p["w"] > 0.0]
+    if len(pts) < 3:
         return None, None, False
-    ref = points[-1]
-    px_ref = np.array([ref["x"], ref["y"]])
-    d_ref = ref["d"]
-    pr2 = np.dot(px_ref, px_ref)
+    ref = pts[-1]
+    px_ref = np.array([ref["x"], ref["y"]]); d_ref = ref["d"]; pr2 = np.dot(px_ref, px_ref)
     A, b, Wd = [], [], []
-    for i in range(len(points) - 1):
-        p = points[i]
-        pi = np.array([p["x"], p["y"]])
-        di = p["d"]
+    for p in pts[:-1]:
+        pi = np.array([p["x"], p["y"]]); di = p["d"]
         A.append(2.0 * (pi - px_ref))
         b.append((di*di - d_ref*d_ref) - (np.dot(pi, pi) - pr2))
         Wd.append(0.5 * (p["w"] + ref["w"]))
-    A = np.vstack(A)
-    b = np.array(b).reshape(-1, 1)
-    W = np.diag(Wd)
+    A = np.vstack(A); b = np.array(b).reshape(-1,1); W = np.diag(Wd)
     try:
-        x_hat = np.linalg.pinv(A.T @ W @ A) @ (A.T @ W @ b)
-        x0 = x_hat.flatten()
+        x0 = (np.linalg.pinv(A.T @ W @ A) @ (A.T @ W @ b)).flatten()
     except Exception:
         return None, None, False
-    res = []
-    for p in points:
-        res.append((math.hypot(x0[0]-p["x"], x0[1]-p["y"]) - p["d"])**2)
+    res = [(math.hypot(x0[0]-p["x"], x0[1]-p["y"]) - p["d"])**2 for p in pts]
     rmse = math.sqrt(sum(res)/len(res))
     return (x0[0], x0[1]), rmse, True
 
 def gn_refine_2d(points, x_init, iters=4):
+    pts = [p for p in points if p["d"] is not None and p["w"] > 0.0]
+    if len(pts) < 3: return x_init, None
     x = np.array(x_init, dtype=float)
     for _ in range(iters):
         J, r, W = [], [], []
-        for p in points:
-            dx = x[0] - p["x"]; dy = x[1] - p["y"]
+        for p in pts:
+            dx = x[0]-p["x"]; dy = x[1]-p["y"]
             rng = math.hypot(dx, dy) or 1e-3
-            J.append([dx/rng, dy/rng])
-            r.append(rng - p["d"])
-            W.append(p["w"])
+            J.append([dx/rng, dy/rng]); r.append(rng - p["d"]); W.append(p["w"])
         J = np.array(J); r = np.array(r).reshape(-1,1); Wm = np.diag(W)
         try:
-            H = J.T @ Wm @ J
-            g = J.T @ Wm @ r
-            step = -np.linalg.pinv(H) @ g
-            x = (x.reshape(-1,1) + step).flatten()
+            step = -np.linalg.pinv(J.T @ Wm @ J) @ (J.T @ Wm @ r)
         except Exception:
             break
-        if np.linalg.norm(step) < 0.05:  # <5 cm
-            break
-    res = [(math.hypot(x[0]-p["x"], x[1]-p["y"]) - p["d"])**2 for p in points]
+        x = (x.reshape(-1,1) + step).flatten()
+        if np.linalg.norm(step) < 0.05: break
+    res = [(math.hypot(x[0]-p["x"], x[1]-p["y"]) - p["d"])**2 for p in pts]
     rmse = math.sqrt(sum(res)/len(res)) if res else None
     return (x[0], x[1]), rmse
 
 def freq_to_channel(freq_mhz):
-    try:
-        f = int(freq_mhz or 0)
-    except Exception:
-        return None
+    try: f = int(freq_mhz or 0)
+    except Exception: return None
     if 2412 <= f <= 2484:
-        if f == 2484: return 14
-        return (f - 2407) // 5
-    if 5160 <= f <= 5885:
-        return (f - 5000) // 5
-    if 5925 <= f <= 7125:
-        return (f - 5950) // 5
+        return 14 if f==2484 else (f-2407)//5
+    if 5160 <= f <= 5885: return (f-5000)//5
+    if 5925 <= f <= 7125: return (f-5950)//5
     return None
 
-# ---------- Robust GPS thread ----------
+# -------- GPS --------
 class GpsThread(threading.Thread):
-    """
-    Polls gpsd, keeps last-good fix with age, altitude, and mode (2D/3D).
-    get_fix(max_age_s) returns None if stale; get_status() returns (mode_str, age, alt).
-    """
     def __init__(self, host, port):
         super().__init__(daemon=True)
-        self.host = host
-        self.port = port
-        self._lock = threading.Lock()
-        self._fix = None          # dict: lat, lon, alt, mode, ts_iso, ts_mono
-        self._stop = threading.Event()
-
+        self.host = host; self.port = port
+        self._lock = threading.Lock(); self._fix = None; self._stop = threading.Event()
     def run(self):
         if gpsd is None:
-            print("[!] gpsd-py3 not available in this interpreter. Run with your venv's python.", file=sys.stderr)
-            return
-        try:
-            gpsd.connect(host=self.host, port=self.port)
+            print("[!] gpsd-py3 missing; use venv python.", file=sys.stderr); return
+        try: gpsd.connect(host=self.host, port=self.port)
         except Exception as e:
-            print(f"[!] gpsd connect failed: {e}", file=sys.stderr)
-            return
-
+            print(f"[!] gpsd connect failed: {e}", file=sys.stderr); return
         while not self._stop.is_set():
             try:
                 p = gpsd.get_current()
                 mode = int(getattr(p, "mode", 1) or 1)
-                lat = getattr(p, "lat", None)
-                lon = getattr(p, "lon", None)
-                # altitude may be .alt or .altitude depending on version
+                lat = getattr(p, "lat", None); lon = getattr(p, "lon", None)
                 alt = None
                 for k in ("alt", "altitude"):
                     v = getattr(p, k, None)
                     if v is not None:
-                        try:
-                            alt = float(v)
-                        except Exception:
-                            pass
+                        try: alt = float(v)
+                        except Exception: pass
                         break
-
                 if mode >= 2 and lat is not None and lon is not None:
                     with self._lock:
-                        self._fix = {
-                            "lat": float(lat),
-                            "lon": float(lon),
-                            "alt": float(alt) if alt is not None else None,
-                            "mode": mode,
-                            "ts_iso": now_iso(),
-                            "ts_mono": time.monotonic()
-                        }
-            except Exception:
-                pass
+                        self._fix = {"lat": float(lat), "lon": float(lon), "alt": float(alt) if alt is not None else None,
+                                     "mode": mode, "ts_iso": now_iso(), "ts_mono": now_mono()}
+            except Exception: pass
             time.sleep(0.25)
-
-    def stop(self):
-        self._stop.set()
-
-    def get_fix(self, max_age_s=2.0, require_3d=False):
-        """
-        Return the most recent fix if not older than max_age_s.
-        If require_3d=True, only return if mode==3.
-        """
-        with self._lock:
-            f = self._fix
-        if not f:
-            return None
-        age = time.monotonic() - f["ts_mono"]
-        if age > max_age_s:
-            return None
-        if require_3d and f.get("mode", 1) != 3:
-            return None
+    def stop(self): self._stop.set()
+    def get_fix(self, max_age_s=10.0, require_3d=False):
+        with self._lock: f = self._fix
+        if not f: return None
+        if now_mono() - f["ts_mono"] > max_age_s: return None
+        if require_3d and f.get("mode",1) != 3: return None
         return dict(f)
-
     def get_status(self):
-        with self._lock:
-            f = self._fix
-        if not f:
-            return ("NO FIX", None, None)
-        age = time.monotonic() - f["ts_mono"]
-        mode = f.get("mode", 1)
-        mode_str = "3D" if mode == 3 else ("2D" if mode == 2 else "NO FIX")
-        return (mode_str, round(age, 1), f.get("alt"))
+        with self._lock: f = self._fix
+        if not f: return ("NO FIX", None, None)
+        age = now_mono() - f["ts_mono"]; mode = f.get("mode",1)
+        return ("3D" if mode==3 else ("2D" if mode==2 else "NO FIX"), round(age,1), f.get("alt"))
 
-# ---------- MQTT ----------
+# -------- MQTT --------
 class MqttClient:
     def __init__(self, host, port, username=None, password=None, base_topic="wifi_radar", qos=0, retain=False):
-        self.client = None
-        self.qos = int(qos); self.retain = bool(retain)
+        self.client=None; self.qos=int(qos); self.retain=bool(retain); self.base=base_topic.rstrip("/")
         if mqtt is None: return
-        self.client = mqtt.Client()
+        self.client=mqtt.Client()
         if username: self.client.username_pw_set(username, password or None)
-        try:
-            self.client.connect(host, int(port), keepalive=30)
-            self.client.loop_start()
-        except Exception as e:
-            print(f"[!] MQTT connect failed: {e}", file=sys.stderr)
-            self.client = None
-        self.base = base_topic.rstrip("/")
-
-    def publish_ap(self, bssid, payload_dict):
-        if self.client is None: return
-        topic = f"{self.base}/aps/{bssid.replace(':','').lower()}"
-        try:
-            self.client.publish(topic, json.dumps(payload_dict, ensure_ascii=False), qos=self.qos, retain=self.retain)
-        except Exception as e:
-            print(f"[!] MQTT publish error: {e}", file=sys.stderr)
-
+        try: self.client.connect(host, int(port), keepalive=30); self.client.loop_start()
+        except Exception as e: print(f"[!] MQTT connect failed: {e}", file=sys.stderr); self.client=None
+    def publish_ap(self, bssid, payload):
+        if not self.client: return
+        topic=f"{self.base}/aps/{bssid.replace(':','').lower()}"
+        try: self.client.publish(topic, json.dumps(payload, ensure_ascii=False), qos=self.qos, retain=self.retain)
+        except Exception as e: print(f"[!] MQTT publish error: {e}", file=sys.stderr)
     def close(self):
         if self.client:
-            try:
-                self.client.loop_stop(); self.client.disconnect()
-            except Exception:
-                pass
+            try: self.client.loop_stop(); self.client.disconnect()
+            except Exception: pass
 
-# ---------- Radar core ----------
+# -------- Radar --------
 class WifiRadar:
-    def __init__(self, iface, out_geojson, calib, min_rssi=-88, min_samples=3, write_period=2.0,
-                 mqtt_client: MqttClient=None, show_radar=False, radar_radius_m=120.0):
-        self.iface = iface
-        self.out_geojson = out_geojson
-        self.calib = calib
-        self.min_rssi = int(min_rssi)
-        self.min_samples = int(min_samples)
-        self.write_period = float(write_period)
-        self.mqtt = mqtt_client
-        self.show_radar = bool(show_radar)
-        self.radar_radius_m = float(radar_radius_m)
+    def __init__(self, iface, out_geojson, calib, min_rssi=-90, min_samples=3, write_period=2.0,
+                 mqtt_client: MqttClient=None, show_radar=False, radar_radius_m=120.0,
+                 count_without_gps=False, rssi_display_min=-70, prune_age_s=20.0):
+        self.iface=iface; self.out_geojson=out_geojson; self.calib=calib
+        self.min_rssi=int(min_rssi); self.min_samples=int(min_samples); self.write_period=float(write_period)
+        self.mqtt=mqtt_client; self.show_radar=bool(show_radar); self.radar_radius_m=float(radar_radius_m)
+        self.count_without_gps=bool(count_without_gps)
+        self.rssi_display_min=int(rssi_display_min)   # only accept frames with RSSI >= this
+        self.prune_age_s=float(prune_age_s)           # hide APs not seen recently
 
-        self.origin = None
-        self.lock = threading.Lock()
-        self._stop = threading.Event()
-        self._last_write = 0.0
+        self.origin=None
+        self.lock=threading.Lock(); self._stop=threading.Event(); self._last_write=0.0
 
+        # Seen (counts even without GPS) + samples (only for positioning)
+        self.seen = defaultdict(lambda: {
+            "ssid": None, "last_rssi": None, "last_channel": None,
+            "first_seen": None, "last_seen": None, "last_seen_mono": None, "frames": 0
+        })
         self.aps = defaultdict(lambda: {
-            "ssid": None,
-            "last_channel": None,
+            "ssid": None, "last_channel": None,
             "samples": deque(maxlen=4000),  # lat, lon, x, y, rssi, dist, w, alt, ch, ts
-            "est": None,                    # x,y,lat,lon,rmse,n
-            "last_update": None,
+            "est": None, "last_update": None,
         })
 
-        # Radar UI placeholders
-        self._radar_fig = None
-        self._radar_ax = None
-        self._gps_fix = None
+        # GUI state
+        self._radar_fig=None; self._radar_ax=None; self._gps_fix=None; self._plt=None
 
     def set_origin_if_needed(self, lat, lon):
         if self.origin is None:
-            self.origin = (lat, lon)
-            print(f"[i] Origin fixed at lat={lat:.6f}, lon={lon:.6f}")
+            self.origin=(lat,lon); print(f"[i] Origin fixed at lat={lat:.6f}, lon={lon:.6f}")
+
+    def register_seen(self, bssid, ssid, rssi, channel):
+        # Filter by display threshold
+        if rssi is None or int(rssi) < self.rssi_display_min:
+            return
+        with self.lock:
+            s = self.seen[bssid]
+            if ssid: s["ssid"]=ssid
+            if channel: s["last_channel"]=channel
+            s["last_rssi"]=int(rssi)
+            now_iso_str = now_iso(); now_m = now_mono()
+            if s["first_seen"] is None: s["first_seen"]=now_iso_str
+            s["last_seen"]=now_iso_str; s["last_seen_mono"]=now_m
+            s["frames"] += 1
 
     def add_observation(self, bssid, ssid, lat, lon, alt, rssi_dbm, channel):
-        if rssi_dbm is None or rssi_dbm < self.min_rssi:
+        if rssi_dbm is None or int(rssi_dbm) < self.rssi_display_min:
+            return
+        if rssi_dbm is not None and rssi_dbm < self.min_rssi:
             return
         self.set_origin_if_needed(lat, lon)
-        lat0, lon0 = self.origin
-        x, y = latlon_to_xy(lat, lon, lat0, lon0)
-        dist = rssi_to_distance(rssi_dbm,
-                                rssi_at_1m=self.calib["rssi_at_1m"],
-                                path_loss_n=self.calib["path_loss_n"],
-                                d0=self.calib["d0"])
+        lat0, lon0 = self.origin; x, y = latlon_to_xy(lat, lon, lat0, lon0)
+        dist = rssi_to_distance(rssi_dbm, self.calib["rssi_at_1m"], self.calib["path_loss_n"], self.calib["d0"])
         w = robust_weight(dist, rssi_dbm)
-        sample = {
-            "lat": lat, "lon": lon, "x": x, "y": y,
-            "alt": alt, "rssi": float(rssi_dbm), "dist": float(dist), "w": float(w),
-            "channel": channel, "ts": now_iso()
-        }
+        sample={"lat":lat,"lon":lon,"x":x,"y":y,"alt":alt,
+                "rssi":(float(rssi_dbm) if rssi_dbm is not None else None),
+                "dist":(float(dist) if dist is not None else None),
+                "w":float(w),"channel":channel,"ts":now_iso()}
         with self.lock:
-            ap = self.aps[bssid]
-            if ssid:
-                ap["ssid"] = ssid
-            if channel:
-                ap["last_channel"] = channel
+            ap=self.aps[bssid]
+            if ssid: ap["ssid"]=ssid
+            if channel: ap["last_channel"]=channel
             ap["samples"].append(sample)
 
     def _estimate_ap(self, samples):
-        if len(samples) < self.min_samples:
-            return None
-        pts = [{"x": s["x"], "y": s["y"], "d": s["dist"], "w": s["w"]} for s in samples]
+        pts=[{"x":s["x"],"y":s["y"],"d":s["dist"],"w":s["w"]} for s in samples if s["dist"] is not None and s["w"]>0.0]
+        if len(pts) < self.min_samples: return None
         x0, rmse0, ok = wls_trilaterate_2d(pts)
         if not ok: return None
         x_ref, rmse = gn_refine_2d(pts, x0, iters=4)
@@ -322,152 +239,180 @@ class WifiRadar:
 
     def _publish_mqtt(self, bssid, ap):
         if self.mqtt is None: return
-        est = ap.get("est")
+        est=ap.get("est")
         if not est: return
-        last = ap["samples"][-1] if ap["samples"] else {}
-        payload = {
-            "BSSID": bssid,
-            "SSID": ap.get("ssid"),
-            "RSSI": float(last.get("rssi")) if last else None,
-            "Channel": ap.get("last_channel"),
-            "Lat": float(est["lat"]),
-            "Lon": float(est["lon"]),
-            "Alt": float(last.get("alt")) if last.get("alt") is not None else None,
-            "RMSE_m": float(est.get("rmse")),
-            "Samples": len(ap["samples"]),
-            "UpdatedAt": ap.get("last_update"),
-        }
+        last=ap["samples"][-1] if ap["samples"] else {}
+        payload={"BSSID":bssid,"SSID":ap.get("ssid"),"RSSI":last.get("rssi"),
+                 "Channel":ap.get("last_channel"),"Lat":float(est["lat"]),"Lon":float(est["lon"]),
+                 "Alt":(float(last.get("alt")) if last.get("alt") is not None else None),
+                 "RMSE_m":float(est.get("rmse")),"Samples":len(ap["samples"]),
+                 "UpdatedAt":ap.get("last_update")}
         self.mqtt.publish_ap(bssid, payload)
 
     def _try_update_estimate(self, bssid, ap):
-        if len(ap["samples"]) < self.min_samples or self.origin is None:
-            return None
-        res = self._estimate_ap(list(ap["samples"]))
+        if self.origin is None: return None
+        res=self._estimate_ap(list(ap["samples"]))
         if not res: return None
-        x, y, rmse = res
-        lat0, lon0 = self.origin
-        lat, lon = xy_to_latlon(x, y, lat0, lon0)
-        est = {"x": float(x), "y": float(y), "lat": float(lat), "lon": float(lon), "rmse": float(rmse)}
-        ap["est"] = est
-        ap["last_update"] = now_iso()
-        self._publish_mqtt(bssid, ap)
-        return est
+        x,y,rmse=res; lat0,lon0=self.origin; lat,lon=xy_to_latlon(x,y,lat0,lon0)
+        est={"x":float(x),"y":float(y),"lat":float(lat),"lon":float(lon),"rmse":float(rmse)}
+        ap["est"]=est; ap["last_update"]=now_iso(); self._publish_mqtt(bssid, ap); return est
 
     def _write_geojson(self):
+        # Keep logging positions even if an AP is not currently visible.
         if self.origin is None: return
-        features = []
+        feats=[]
         with self.lock:
             for bssid, ap in self.aps.items():
-                est = ap.get("est")
-                if not est:
-                    est = self._try_update_estimate(bssid, ap)
+                est = ap.get("est") or self._try_update_estimate(bssid, ap)
                 if not est: continue
-                props = {
-                    "bssid": bssid,
-                    "ssid": ap.get("ssid"),
-                    "last_update": ap.get("last_update"),
-                    "n_samples": len(ap["samples"]),
-                    "rmse_m": est.get("rmse"),
-                    "last_channel": ap.get("last_channel"),
-                }
-                feat = {
-                    "type": "Feature",
-                    "geometry": {"type": "Point", "coordinates": [est["lon"], est["lat"]]},
-                    "properties": props
-                }
-                features.append(feat)
-        if not features: return
-        fc = {"type": "FeatureCollection", "features": features}
-        tmp = self.out_geojson + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(fc, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.out_geojson)
+                props={"bssid":bssid,"ssid":ap.get("ssid"),"last_update":ap.get("last_update"),
+                       "n_samples":len(ap["samples"]),"rmse_m":est.get("rmse"),
+                       "last_channel":ap.get("last_channel")}
+                feats.append({"type":"Feature","geometry":{"type":"Point","coordinates":[est["lon"],est["lat"]]},
+                              "properties":props})
+        if not feats: return
+        fc={"type":"FeatureCollection","features":feats}; tmp=self.out_geojson+".tmp"
+        with open(tmp,"w",encoding="utf-8") as f: json.dump(fc,f,ensure_ascii=False,indent=2)
+        os.replace(tmp,self.out_geojson)
 
-    def periodic(self, gps_thread: "GpsThread"):
+    # ---------- provisional RSSI markers ----------
+    def _stable_theta(self, bssid: str) -> float:
+        h = hashlib.sha1(bssid.encode("utf-8")).digest()
+        val = int.from_bytes(h[:4], "big")
+        return (val % 3600) / 3600.0 * 2.0 * math.pi  # 0..2π
+
+    def _last_distance(self, bssid: str):
+        ap = self.aps.get(bssid)
+        if ap and ap["samples"]:
+            for s in reversed(ap["samples"]):
+                if s.get("dist") is not None:
+                    return float(s["dist"])
+        s = self.seen.get(bssid)
+        if s and s.get("last_rssi") is not None:
+            return rssi_to_distance(s["last_rssi"], self.calib["rssi_at_1m"], self.calib["path_loss_n"], self.calib["d0"])
+        return None
+
+    def _is_recent(self, bssid: str):
+        s = self.seen.get(bssid)
+        if not s: return False
+        last_m = s.get("last_seen_mono")
+        if last_m is None: return False
+        return (now_mono() - float(last_m)) <= self.prune_age_s
+    # ------------------------------------------------
+
+    def periodic(self, gps_thread):
         while not self._stop.is_set():
             with self.lock:
-                for bssid, ap in self.aps.items():
-                    if len(ap["samples"]) >= self.min_samples:
-                        self._try_update_estimate(bssid, ap)
-            t = time.time()
+                for bssid, ap in list(self.aps.items()):
+                    self._try_update_estimate(bssid, ap)
+            t=time.time()
             if t - self._last_write >= self.write_period and self.origin is not None:
-                self._write_geojson()
-                self._last_write = t
-            self._gps_fix = gps_thread.get_fix(max_age_s=2.0)
+                self._write_geojson(); self._last_write=t
+            self._gps_fix=gps_thread.get_fix(max_age_s=10.0)
             time.sleep(0.5)
 
     def stop(self): self._stop.set()
 
-    # --------- Optional Radar UI ---------
+    # ---- GUI in main thread ----
     def start_radar_ui(self):
-        if not self.show_radar:
-            return
-        # Lazy import to avoid Tk issues when headless
+        if not self.show_radar: return
         try:
+            import matplotlib; matplotlib.use("TkAgg")
             import matplotlib.pyplot as plt
         except Exception as e:
-            print(f"[!] Matplotlib not available for GUI: {e}", file=sys.stderr)
-            return
-        self._plt = plt
+            print(f"[!] Matplotlib/Tk not available: {e}", file=sys.stderr); return
+        self._plt=plt; plt.ion()
         self._radar_fig, self._radar_ax = plt.subplots(subplot_kw={'projection':'polar'})
-        self._radar_ax.set_title("Wi-Fi Radar (estimates relative to you)")
-        self._radar_ax.set_ylim(0, self.radar_radius_m)
-        self._radar_ax.grid(True)
-        t = threading.Thread(target=self._radar_loop, daemon=True)
-        t.start()
+        self._radar_ax.set_title("Wi-Fi Radar — estimated (●) vs provisional (⨯)")
+        self._radar_ax.set_ylim(0, self.radar_radius_m); self._radar_ax.grid(True)
+        print(f"[i] Matplotlib backend: {plt.get_backend()} DISPLAY={os.environ.get('DISPLAY')}")
+        plt.show(block=False)
 
-    def _radar_loop(self):
-        plt = getattr(self, "_plt", None)
-        if plt is None: return
-        while not self._stop.is_set():
-            try:
-                fix = self._gps_fix
-                if not fix or self.origin is None:
-                    time.sleep(0.3); continue
-                lat0, lon0 = fix["lat"], fix["lon"]
-                thetas, rs, labels = [], [], []
-                with self.lock:
-                    for bssid, ap in self.aps.items():
-                        est = ap.get("est")
-                        if not est: continue
-                        x, y = latlon_to_xy(est["lat"], est["lon"], lat0, lon0)
-                        r = math.hypot(x, y)
-                        if r > self.radar_radius_m: continue
-                        theta = (math.degrees(math.atan2(x, y)) % 360.0) * math.pi/180.0
-                        thetas.append(theta); rs.append(r)
-                        labels.append(ap.get("ssid") or bssid)
-                self._radar_ax.clear()
-                self._radar_ax.set_ylim(0, self.radar_radius_m)
-                self._radar_ax.set_title("Wi-Fi Radar (estimates relative to you)")
-                self._radar_ax.grid(True)
-                self._radar_ax.scatter(thetas, rs, s=30)
-                for th, rr, lab in sorted(zip(thetas, rs, labels), key=lambda t: t[1])[:5]:
-                    self._radar_ax.text(th, rr, lab[:12], fontsize=8)
-                plt.pause(0.2)
-            except Exception:
-                time.sleep(0.5)
+    def update_radar_ui(self):
+        if not self.show_radar or self._plt is None or self._radar_ax is None:
+            return
+        fix=self._gps_fix
+        if not fix:
+            self._plt.pause(0.01); return
+        lat0,lon0=fix["lat"],fix["lon"]
 
-# ---------- Scapy helpers ----------
+        est_thetas, est_rs, est_labels = [], [], []
+        prov_thetas, prov_rs, prov_labels = [], [], []
+
+        with self.lock:
+            # Estimated APs (only show if recently seen)
+            for bssid, ap in self.aps.items():
+                if not self._is_recent(bssid):  # hide when out of range
+                    continue
+                est=ap.get("est")
+                if est:
+                    x,y=latlon_to_xy(est["lat"],est["lon"],lat0,lon0)
+                    r=math.hypot(x,y)
+                    if r<=self.radar_radius_m:
+                        theta=(math.degrees(math.atan2(x,y))%360.0)*math.pi/180.0
+                        est_thetas.append(theta); est_rs.append(r); est_labels.append(bssid)
+
+            # Provisional (distance-only) markers (also require recent)
+            for bssid, s in self.seen.items():
+                if not self._is_recent(bssid):
+                    continue
+                ap = self.aps.get(bssid)
+                has_est = bool(ap and ap.get("est"))
+                if has_est: continue
+                d = self._last_distance(bssid)
+                if d is None: continue
+                r = min(d, self.radar_radius_m)
+                theta = self._stable_theta(bssid)
+                prov_thetas.append(theta); prov_rs.append(r); prov_labels.append(bssid)
+
+        ax=self._radar_ax
+        ax.clear()
+        ax.set_ylim(0, self.radar_radius_m)
+        ax.set_title("Wi-Fi Radar — estimated (●) vs provisional (⨯)")
+        ax.grid(True)
+
+        if prov_thetas:
+            ax.scatter(prov_thetas, prov_rs, s=25, marker='x')
+        if est_thetas:
+            ax.scatter(est_thetas, est_rs, s=36)
+
+        # Label ALL points with BSSID (trim to 17 chars)
+        for th, rr, lab in zip(est_thetas, est_rs, est_labels):
+            ax.text(th, rr, (lab or "")[:17], fontsize=8)
+        for th, rr, lab in zip(prov_thetas, prov_rs, prov_labels):
+            ax.text(th, rr, (lab or "")[:17], fontsize=7)
+
+        self._plt.pause(0.01)
+
+# ---- Scapy helpers ----
 def parse_ssid(pkt):
-    ssid = None
+    ssid=None
     try:
-        elt = pkt.getlayer(Dot11Elt)
+        elt=pkt.getlayer(Dot11Elt)
         while isinstance(elt, Dot11Elt):
-            if elt.ID == 0:
-                ssid = elt.info.decode(errors="ignore")
-                if ssid == "": ssid = None
+            if elt.ID==0:
+                try:
+                    s=elt.info.decode(errors="ignore")
+                    ssid=s if s!="" else None
+                except Exception:
+                    ssid=None
                 break
-            elt = elt.payload.getlayer(Dot11Elt)
-    except Exception:
-        pass
+            elt=elt.payload.getlayer(Dot11Elt)
+    except Exception: pass
     return ssid
 
 def get_rssi_dbm(pkt):
     try:
         if pkt.haslayer(RadioTap):
-            val = getattr(pkt[RadioTap], "dBm_AntSignal", None)
-            if val is not None:
-                return int(val)
+            rt = pkt[RadioTap]
+            for key in ("dBm_AntSignal","dBm_ant_signal","dbm_antsignal","antenna_signal"):
+                val = getattr(rt, key, None)
+                if val is not None:
+                    return int(val)
+            if hasattr(rt, "fields"):
+                for key in ("dBm_AntSignal","dBm_ant_signal","dbm_antsignal","antenna_signal"):
+                    if key in rt.fields and rt.fields[key] is not None:
+                        return int(rt.fields[key])
     except Exception:
         pass
     try:
@@ -478,47 +423,46 @@ def get_rssi_dbm(pkt):
     return None
 
 def get_channel_from_pkt(pkt):
-    freq = None
+    freq=None
     try:
         if pkt.haslayer(RadioTap):
-            freq = getattr(pkt[RadioTap], "ChannelFrequency", None)
-    except Exception:
-        pass
-    ch = None
-    if freq: ch = freq_to_channel(freq)
+            freq=getattr(pkt[RadioTap], "ChannelFrequency", None)
+    except Exception: pass
+    ch=freq_to_channel(freq) if freq else None
     if ch is None:
         try:
-            elt = pkt.getlayer(Dot11Elt)
+            elt=pkt.getlayer(Dot11Elt)
             while isinstance(elt, Dot11Elt):
-                if elt.ID == 3 and len(elt.info) >= 1:
-                    ch = int(elt.info[0])
-                    break
-                elt = elt.payload.getlayer(Dot11Elt)
-        except Exception:
-            pass
+                if elt.ID==3 and len(elt.info)>=1:
+                    ch=int(elt.info[0]); break
+                elt=elt.payload.getlayer(Dot11Elt)
+        except Exception: pass
     return ch
 
-def scapy_sniff_thread(iface, radar: WifiRadar, gps: GpsThread, stop_evt: threading.Event,
-                       gps_max_age_s=2.0, require_3d_fix=False):
+def scapy_sniff_thread(iface, radar: WifiRadar, gps: "GpsThread", stop_evt: threading.Event,
+                       gps_max_age_s=10.0, require_3d_fix=False, count_without_gps=False):
     def handler(pkt):
         if stop_evt.is_set(): return True
         try:
             if not pkt.haslayer(Dot11): return
-            d11 = pkt[Dot11]
-            if d11.type != 0 or d11.subtype not in (5, 8):  # probe resp or beacon
+            d11=pkt[Dot11]
+            if d11.type!=0 or d11.subtype not in (5,8):
                 return
-            bssid = d11.addr3
+            bssid=d11.addr3
             if not bssid: return
-            rssi = get_rssi_dbm(pkt)
-            ssid = parse_ssid(pkt)
-            ch = get_channel_from_pkt(pkt)
-            fix = gps.get_fix(max_age_s=gps_max_age_s, require_3d=require_3d_fix)
-            if not fix: return
-            radar.add_observation(
-                bssid=bssid, ssid=ssid,
-                lat=fix["lat"], lon=fix["lon"], alt=fix.get("alt"),
-                rssi_dbm=rssi, channel=ch
-            )
+            rssi=get_rssi_dbm(pkt)
+            ssid=parse_ssid(pkt)
+            ch=get_channel_from_pkt(pkt)
+
+            radar.register_seen(bssid, ssid, rssi, ch)
+
+            fix=gps.get_fix(max_age_s=gps_max_age_s, require_3d=require_3d_fix)
+            if not fix:
+                if not count_without_gps:
+                    return
+                return
+            radar.add_observation(bssid=bssid, ssid=ssid, lat=fix["lat"], lon=fix["lon"],
+                                  alt=fix.get("alt"), rssi_dbm=rssi, channel=ch)
         except Exception:
             pass
     try:
@@ -526,119 +470,96 @@ def scapy_sniff_thread(iface, radar: WifiRadar, gps: GpsThread, stop_evt: thread
     except Exception as e:
         print(f"[!] Sniff error on {iface}: {e}", file=sys.stderr)
 
-# ---------- Calibration I/O ----------
+# ---- Calib I/O ----
 def load_calib(path, fallback_rssi1m, fallback_n, fallback_d0):
     if not path: return {"rssi_at_1m": fallback_rssi1m, "path_loss_n": fallback_n, "d0": fallback_d0}
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
-    return {
-        "rssi_at_1m": float(data.get("rssi_at_1m", fallback_rssi1m)),
-        "path_loss_n": float(data.get("path_loss_n", fallback_n)),
-        "d0": float(data.get("d0", fallback_d0)),
-    }
+    with open(path,"r",encoding="utf-8") as f: data=yaml.safe_load(f) or {}
+    return {"rssi_at_1m": float(data.get("rssi_at_1m",fallback_rssi1m)),
+            "path_loss_n": float(data.get("path_loss_n",fallback_n)),
+            "d0": float(data.get("d0",fallback_d0))}
 
 def save_calib(path, rssi_at_1m, path_loss_n, d0):
-    data = {"rssi_at_1m": float(rssi_at_1m), "path_loss_n": float(path_loss_n), "d0": float(d0), "saved_at": now_iso()}
-    with open(path, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f)
+    data={"rssi_at_1m":float(rssi_at_1m),"path_loss_n":float(path_loss_n),
+          "d0":float(d0),"saved_at":now_iso()}
+    with open(path,"w",encoding="utf-8") as f: yaml.safe_dump(data,f)
     print(f"[i] Calibration saved to {path}")
 
-# ---------- CLI / Main ----------
+# ---- Main ----
 def main():
-    ap = argparse.ArgumentParser(description="Wi-Fi Radar (walking, 5 dBi omni, MQTT, robust GPS)")
-    ap.add_argument("--iface", required=True, help="Monitor-mode interface (e.g., wlan1)")
-    ap.add_argument("--gpsd", default="127.0.0.1:2947", help="gpsd host:port")
-    ap.add_argument("--out-geojson", default="ap_estimates.geojson", help="Output GeoJSON path")
-    ap.add_argument("--min-rssi", type=int, default=-88, help="Ignore frames weaker than this (dBm)")
-    ap.add_argument("--min-samples", type=int, default=3, help="Min samples per BSSID to solve")
-    ap.add_argument("--write-period", type=float, default=2.0, help="GeoJSON write interval seconds")
-    # Calibration
-    ap.add_argument("--calib", help="YAML with rssi_at_1m, path_loss_n, d0")
-    ap.add_argument("--rssi-at-1m", type=float, default=-45.0, help="Fallback RSSI at 1 m")
-    ap.add_argument("--n", dest="path_loss_n", type=float, default=2.5, help="Fallback path-loss exponent")
-    ap.add_argument("--d0", type=float, default=1.0, help="Reference distance (m)")
-    ap.add_argument("--save-calib", help="Write a calibration YAML and exit")
-    # GPS robustness
-    ap.add_argument("--gps-max-age", type=float, default=2.0, help="Grace period to reuse last good GPS fix (s)")
-    ap.add_argument("--require-3d-fix", action="store_true", help="Only accept GPS samples with 3D fix")
-    # MQTT
-    ap.add_argument("--mqtt-host", default=None, help="MQTT broker host (omit to disable MQTT)")
-    ap.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port")
-    ap.add_argument("--mqtt-user", default=None, help="MQTT username")
-    ap.add_argument("--mqtt-pass", default=None, help="MQTT password")
-    ap.add_argument("--mqtt-base", default="wifi_radar", help="MQTT base topic")
-    ap.add_argument("--mqtt-qos", type=int, default=0, help="MQTT QoS (0/1/2)")
-    ap.add_argument("--mqtt-retain", action="store_true", help="Retain MQTT messages")
-    # Radar UI
-    ap.add_argument("--show-radar", action="store_true", help="Show radar-style live plot (requires GUI/Tk)")
-    ap.add_argument("--radar-radius", type=float, default=120.0, help="Radar range (m)")
-    args = ap.parse_args()
+    ap=argparse.ArgumentParser(description="Wi-Fi Radar: RSSI-filtered view with auto-prune")
+    ap.add_argument("--iface", required=True)
+    ap.add_argument("--gpsd", default="127.0.0.1:2947")
+    ap.add_argument("--out-geojson", default="ap_estimates.geojson")
+    ap.add_argument("--min-rssi", type=int, default=-90)
+    ap.add_argument("--min-samples", type=int, default=3)
+    ap.add_argument("--write-period", type=float, default=2.0)
+    ap.add_argument("--calib"); ap.add_argument("--rssi-at-1m", type=float, default=-45.0)
+    ap.add_argument("--n", dest="path_loss_n", type=float, default=2.5); ap.add_argument("--d0", type=float, default=1.0)
+    ap.add_argument("--save-calib")
+    ap.add_argument("--gps-max-age", type=float, default=10.0); ap.add_argument("--require-3d-fix", action="store_true")
+    ap.add_argument("--mqtt-host", default=None); ap.add_argument("--mqtt-port", type=int, default=1883)
+    ap.add_argument("--mqtt-user", default=None); ap.add_argument("--mqtt-pass", default=None)
+    ap.add_argument("--mqtt-base", default="wifi_radar"); ap.add_argument("--mqtt-qos", type=int, default=0)
+    ap.add_argument("--mqtt-retain", action="store_true")
+    ap.add_argument("--show-radar", action="store_true"); ap.add_argument("--radar-radius", type=float, default=120.0)
+    ap.add_argument("--count-without-gps", action="store_true", help="Count APs even if GPS fix is missing")
+    # NEW:
+    ap.add_argument("--rssi-display-min", type=int, default=-70, help="Accept frames only if RSSI >= this dBm")
+    ap.add_argument("--prune-age", type=float, default=20.0, help="Hide APs not seen for this many seconds")
+    args=ap.parse_args()
 
     if args.save_calib:
-        save_calib(args.save_calib, args.rssi_at_1m, args.path_loss_n, args.d0)
-        return
-
-    calib = load_calib(args.calib, args.rssi_at_1m, args.path_loss_n, args.d0)
+        save_calib(args.save_calib, args.rssi_at_1m, args.path_loss_n, args.d0); return
+    calib=load_calib(args.calib, args.rssi_at_1m, args.path_loss_n, args.d0)
     print(f"[i] Using calibration: {calib}")
+    print(f"[i] RSSI filter: >= {args.rssi_display_min} dBm | prune age: {args.prune_age}s")
 
     # GPS
-    host, port = (args.gpsd.split(":") + ["2947"])[:2]
-    gps = GpsThread(host, int(port)); gps.start()
+    host,port=(args.gpsd.split(":")+["2947"])[:2]; gps=GpsThread(host, int(port)); gps.start()
 
     # MQTT
-    mc = None
+    mc=None
     if args.mqtt_host:
-        mc = MqttClient(
-            host=args.mqtt_host, port=args.mqtt_port,
-            username=args.mqtt_user, password=args.mqtt_pass,
-            base_topic=args.mqtt_base, qos=args.mqtt_qos, retain=args.mqtt_retain
-        )
+        mc=MqttClient(host=args.mqtt_host, port=args.mqtt_port, username=args.mqtt_user,
+                      password=args.mqtt_pass, base_topic=args.mqtt_base, qos=args.mqtt_qos, retain=args.mqtt_retain)
 
-    radar = WifiRadar(
-        iface=args.iface, out_geojson=args.out_geojson, calib=calib,
-        min_rssi=args.min_rssi, min_samples=args.min_samples, write_period=args.write_period,
-        mqtt_client=mc, show_radar=args.show_radar, radar_radius_m=args.radar_radius
-    )
-    radar.start_radar_ui()  # no-op if not enabled
+    radar=WifiRadar(iface=args.iface, out_geojson=args.out_geojson, calib=calib,
+                    min_rssi=args.min_rssi, min_samples=args.min_samples, write_period=args.write_period,
+                    mqtt_client=mc, show_radar=args.show_radar, radar_radius_m=args.radar_radius,
+                    count_without_gps=args.count_without_gps, rssi_display_min=args.rssi_display_min,
+                    prune_age_s=args.prune_age)
+    radar.start_radar_ui()
 
-    stop_evt = threading.Event()
-    sniffer = threading.Thread(
-        target=scapy_sniff_thread,
-        args=(args.iface, radar, gps, stop_evt, args.gps_max_age, args.require_3d_fix),
-        daemon=True
-    )
-    sniffer.start()
-
-    periodic = threading.Thread(target=radar.periodic, args=(gps,), daemon=True)
-    periodic.start()
+    stop_evt=threading.Event()
+    sniffer=threading.Thread(target=scapy_sniff_thread,
+                             args=(args.iface, radar, gps, stop_evt, args.gps_max_age, args.require_3d_fix, args.count_without_gps),
+                             daemon=True); sniffer.start()
+    periodic=threading.Thread(target=radar.periodic, args=(gps,), daemon=True); periodic.start()
 
     def handle_sig(sig, frame):
-        print("\n[!] Stopping ...")
-        stop_evt.set()
-        radar.stop()
-        gps.stop()
-        if mc: mc.close()
-        time.sleep(0.4)
-        sys.exit(0)
-    signal.signal(signal.SIGINT, handle_sig)
-    signal.signal(signal.SIGTERM, handle_sig)
+        print("\n[!] Stopping ..."); stop_evt.set(); radar.stop(); gps.stop()
+        if mc: mc.close(); time.sleep(0.4); sys.exit(0)
+    signal.signal(signal.SIGINT, handle_sig); signal.signal(signal.SIGTERM, handle_sig)
 
-    # Heartbeat
     try:
+        last_print=0.0
         while True:
-            time.sleep(3.5)
+            time.sleep(0.5)
             mode_str, age_s, alt = gps.get_status()
             with radar.lock:
-                n_aps = len(radar.aps)
-                solved = sum(1 for a in radar.aps.values() if a.get("est"))
-            gps_part = f"GPS:{mode_str}"
-            if age_s is not None:
-                gps_part += f" age={age_s}s"
-            if alt is not None:
-                gps_part += f" alt={alt:.1f}m"
-            print(f"[{now_iso()}] APs seen: {n_aps} | estimated: {solved} | {gps_part} | geojson: {args.out_geojson}")
+                ap_detected = len(radar.seen)
+                ap_tagged   = sum(1 for a in radar.aps.values() if len(a["samples"]) > 0)
+                ap_est      = sum(1 for a in radar.aps.values() if a.get("est"))
+            t=time.time()
+            if t-last_print>3.5:
+                gps_part=f"GPS:{mode_str}"
+                if age_s is not None: gps_part+=f" age={age_s}s"
+                if alt is not None: gps_part+=f" alt={alt:.1f}m"
+                print(f"[{now_iso()}] APs detected: {ap_detected} | gps-tagged: {ap_tagged} | estimated: {ap_est} | {gps_part} | geojson: {args.out_geojson}")
+                last_print=t
+            radar.update_radar_ui()
     except KeyboardInterrupt:
         handle_sig(None, None)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
