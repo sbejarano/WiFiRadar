@@ -50,48 +50,6 @@ def robust_weight(distance_m, rssi_dbm):
     sigma = 0.15 * d / rssi_quality
     return 1.0 / (sigma * sigma)
 
-def wls_trilaterate_2d(points):
-    pts = [p for p in points if p["d"] is not None and p["w"] > 0.0]
-    if len(pts) < 3:
-        return None, None, False
-    ref = pts[-1]
-    px_ref = np.array([ref["x"], ref["y"]]); d_ref = ref["d"]; pr2 = np.dot(px_ref, px_ref)
-    A, b, Wd = [], [], []
-    for p in pts[:-1]:
-        pi = np.array([p["x"], p["y"]]); di = p["d"]
-        A.append(2.0 * (pi - px_ref))
-        b.append((di*di - d_ref*d_ref) - (np.dot(pi, pi) - pr2))
-        Wd.append(0.5 * (p["w"] + ref["w"]))
-    A = np.vstack(A); b = np.array(b).reshape(-1,1); W = np.diag(Wd)
-    try:
-        x0 = (np.linalg.pinv(A.T @ W @ A) @ (A.T @ W @ b)).flatten()
-    except Exception:
-        return None, None, False
-    res = [(math.hypot(x0[0]-p["x"], x0[1]-p["y"]) - p["d"])**2 for p in pts]
-    rmse = math.sqrt(sum(res)/len(res))
-    return (x0[0], x0[1]), rmse, True
-
-def gn_refine_2d(points, x_init, iters=4):
-    pts = [p for p in points if p["d"] is not None and p["w"] > 0.0]
-    if len(pts) < 3: return x_init, None
-    x = np.array(x_init, dtype=float)
-    for _ in range(iters):
-        J, r, W = [], [], []
-        for p in pts:
-            dx = x[0]-p["x"]; dy = x[1]-p["y"]
-            rng = math.hypot(dx, dy) or 1e-3
-            J.append([dx/rng, dy/rng]); r.append(rng - p["d"]); W.append(p["w"])
-        J = np.array(J); r = np.array(r).reshape(-1,1); Wm = np.diag(W)
-        try:
-            step = -np.linalg.pinv(J.T @ Wm @ J) @ (J.T @ Wm @ r)
-        except Exception:
-            break
-        x = (x.reshape(-1,1) + step).flatten()
-        if np.linalg.norm(step) < 0.05: break
-    res = [(math.hypot(x[0]-p["x"], x[1]-p["y"]) - p["d"])**2 for p in pts]
-    rmse = math.sqrt(sum(res)/len(res)) if res else None
-    return (x[0], x[1]), rmse
-
 def freq_to_channel(freq_mhz):
     try: f = int(freq_mhz or 0)
     except Exception: return None
@@ -100,6 +58,57 @@ def freq_to_channel(freq_mhz):
     if 5160 <= f <= 5885: return (f-5000)//5
     if 5925 <= f <= 7125: return (f-5950)//5
     return None
+
+# =============== EKF for static AP position [x, y] ==================
+class EKF2D:
+    def __init__(self, q_pos=1.0):
+        self.x = None            # state [x, y] (meters, local tangent plane)
+        self.P = None            # covariance 2x2
+        self.Q = np.diag([q_pos**2, q_pos**2])  # small process noise
+
+    def is_init(self): return self.x is not None
+
+    def init_from_guess(self, x0, y0, pos_std=15.0):
+        self.x = np.array([[float(x0)], [float(y0)]])
+        self.P = np.diag([pos_std**2, pos_std**2])
+
+    def predict(self):
+        if self.x is None: return
+        self.P = self.P + self.Q
+
+    def _joseph_update(self, H, z_res, R):
+        S = H @ self.P @ H.T + R
+        K = self.P @ H.T @ np.linalg.pinv(S)
+        self.x = self.x + K @ z_res
+        I = np.eye(2)
+        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ R @ K.T
+
+    def update_range(self, xu, yu, r_meas, sigma_r):
+        if self.x is None: return
+        dx = self.x[0,0] - xu; dy = self.x[1,0] - yu
+        r = math.hypot(dx, dy)
+        if r < 1e-3: r = 1e-3
+        H = np.array([[dx/r, dy/r]])  # 1x2
+        z_res = np.array([[float(r_meas) - r]])
+        R = np.array([[float(sigma_r)**2]])
+        self._joseph_update(H, z_res, R)
+
+    def update_rdot(self, xu, yu, vx, vy, rdot_meas, sigma_rr):
+        if self.x is None: return
+        dx = self.x[0,0] - xu; dy = self.x[1,0] - yu
+        r = math.hypot(dx, dy)
+        if r < 1e-3: r = 1e-3
+        q = dx*vx + dy*vy
+        rdot = - q / r
+        r2 = r*r; r3 = r2*r
+        dfdx = - (vx*r2 - q*dx) / r3
+        dfdy = - (vy*r2 - q*dy) / r3
+        H = np.array([[dfdx, dfdy]])   # 1x2
+        z_res = np.array([[float(rdot_meas) - rdot]])
+        R = np.array([[float(sigma_rr)**2]])
+        self._joseph_update(H, z_res, R)
+
+# ====================================================================
 
 # -------- GPS --------
 class GpsThread(threading.Thread):
@@ -118,6 +127,8 @@ class GpsThread(threading.Thread):
                 p = gpsd.get_current()
                 mode = int(getattr(p, "mode", 1) or 1)
                 lat = getattr(p, "lat", None); lon = getattr(p, "lon", None)
+                spd = getattr(p, "speed", None)   # m/s
+                trk = getattr(p, "track", None)   # degrees from North
                 alt = None
                 for k in ("alt", "altitude"):
                     v = getattr(p, k, None)
@@ -127,10 +138,17 @@ class GpsThread(threading.Thread):
                         break
                 if mode >= 2 and lat is not None and lon is not None:
                     with self._lock:
-                        self._fix = {"lat": float(lat), "lon": float(lon), "alt": float(alt) if alt is not None else None,
-                                     "mode": mode, "ts_iso": now_iso(), "ts_mono": now_mono()}
-            except Exception: pass
-            time.sleep(0.25)
+                        self._fix = {
+                            "lat": float(lat), "lon": float(lon),
+                            "alt": float(alt) if alt is not None else None,
+                            "mode": mode,
+                            "speed": float(spd) if spd is not None else None,
+                            "track": float(trk) if trk is not None else None,
+                            "ts_iso": now_iso(), "ts_mono": now_mono()
+                        }
+            except Exception:
+                pass
+            time.sleep(0.2)
     def stop(self): self._stop.set()
     def get_fix(self, max_age_s=10.0, require_3d=False):
         with self._lock: f = self._fix
@@ -167,7 +185,8 @@ class MqttClient:
 class WifiRadar:
     def __init__(self, iface, out_geojson, calib, min_rssi=-90, min_samples=3, write_period=2.0,
                  mqtt_client: MqttClient=None, show_radar=False, radar_radius_m=120.0,
-                 count_without_gps=False, rssi_display_min=-70, prune_age_s=20.0):
+                 count_without_gps=False, rssi_display_min=-70, prune_age_s=20.0,
+                 ekf_q=1.0, range_ema_alpha=0.4, rr_ema_alpha=0.5, rr_eps=0.12):
         self.iface=iface; self.out_geojson=out_geojson; self.calib=calib
         self.min_rssi=int(min_rssi); self.min_samples=int(min_samples); self.write_period=float(write_period)
         self.mqtt=mqtt_client; self.show_radar=bool(show_radar); self.radar_radius_m=float(radar_radius_m)
@@ -175,10 +194,16 @@ class WifiRadar:
         self.rssi_display_min=int(rssi_display_min)   # only accept frames with RSSI >= this
         self.prune_age_s=float(prune_age_s)           # hide APs not seen recently
 
+        # EKF/filters
+        self.ekf_q=float(ekf_q)
+        self.range_ema_alpha=float(range_ema_alpha)
+        self.rr_ema_alpha=float(rr_ema_alpha)
+        self.rr_eps=float(rr_eps)
+
         self.origin=None
         self.lock=threading.Lock(); self._stop=threading.Event(); self._last_write=0.0
 
-        # Seen (counts even without GPS) + samples (only for positioning)
+        # Seen + samples + EKF filter per AP
         self.seen = defaultdict(lambda: {
             "ssid": None, "last_rssi": None, "last_channel": None,
             "first_seen": None, "last_seen": None, "last_seen_mono": None, "frames": 0
@@ -187,6 +212,8 @@ class WifiRadar:
             "ssid": None, "last_channel": None,
             "samples": deque(maxlen=4000),  # lat, lon, x, y, rssi, dist, w, alt, ch, ts
             "est": None, "last_update": None,
+            "ekf": EKF2D(q_pos=self.ekf_q),
+            "r_ema": None, "r_last": None, "r_last_t": None, "rr_ema": None
         })
 
         # GUI state
@@ -197,7 +224,7 @@ class WifiRadar:
             self.origin=(lat,lon); print(f"[i] Origin fixed at lat={lat:.6f}, lon={lon:.6f}")
 
     def register_seen(self, bssid, ssid, rssi, channel):
-        # Filter by display threshold
+        # RSSI visibility filter
         if rssi is None or int(rssi) < self.rssi_display_min:
             return
         with self.lock:
@@ -210,18 +237,37 @@ class WifiRadar:
             s["last_seen"]=now_iso_str; s["last_seen_mono"]=now_m
             s["frames"] += 1
 
-    def add_observation(self, bssid, ssid, lat, lon, alt, rssi_dbm, channel):
+    def _sigma_r(self, r, rssi_dbm):
+        base = max(2.0, 0.08*max(0.0, float(r)))
+        if rssi_dbm is None: return base
+        boost = max(0.6, min(1.4, 1.2 - (rssi_dbm + 95.0)/60.0))
+        return base*boost
+
+    def _sigma_rr(self, speed_mps):
+        return max(0.6, 0.35 + 0.25*max(0.0, float(speed_mps or 0.0)))
+
+    def add_observation(self, bssid, ssid, fix, rssi_dbm, channel):
+        """Add a positioning sample (needs GPS). Incorporates EKF with range + range-rate."""
+        lat=fix["lat"]; lon=fix["lon"]; alt=fix.get("alt")
         if rssi_dbm is None or int(rssi_dbm) < self.rssi_display_min:
             return
         if rssi_dbm is not None and rssi_dbm < self.min_rssi:
             return
+
         self.set_origin_if_needed(lat, lon)
-        lat0, lon0 = self.origin; x, y = latlon_to_xy(lat, lon, lat0, lon0)
-        dist = rssi_to_distance(rssi_dbm, self.calib["rssi_at_1m"], self.calib["path_loss_n"], self.calib["d0"])
+        lat0, lon0 = self.origin
+        xu, yu = latlon_to_xy(lat, lon, lat0, lon0)
+
+        # range from RSSI
+        r_meas = rssi_to_distance(rssi_dbm, self.calib["rssi_at_1m"], self.calib["path_loss_n"], self.calib["d0"])
+        if r_meas is None:
+            return
+
+        # store sample
+        dist = r_meas
         w = robust_weight(dist, rssi_dbm)
-        sample={"lat":lat,"lon":lon,"x":x,"y":y,"alt":alt,
-                "rssi":(float(rssi_dbm) if rssi_dbm is not None else None),
-                "dist":(float(dist) if dist is not None else None),
+        sample={"lat":lat,"lon":lon,"x":xu,"y":yu,"alt":alt,
+                "rssi":float(rssi_dbm),"dist":float(dist),
                 "w":float(w),"channel":channel,"ts":now_iso()}
         with self.lock:
             ap=self.aps[bssid]
@@ -229,13 +275,66 @@ class WifiRadar:
             if channel: ap["last_channel"]=channel
             ap["samples"].append(sample)
 
-    def _estimate_ap(self, samples):
-        pts=[{"x":s["x"],"y":s["y"],"d":s["dist"],"w":s["w"]} for s in samples if s["dist"] is not None and s["w"]>0.0]
-        if len(pts) < self.min_samples: return None
-        x0, rmse0, ok = wls_trilaterate_2d(pts)
-        if not ok: return None
-        x_ref, rmse = gn_refine_2d(pts, x0, iters=4)
-        return (x_ref[0], x_ref[1], rmse if rmse is not None else rmse0)
+            # --- range EMA + range-rate EMA ---
+            t = now_mono()
+            if ap["r_ema"] is None:
+                ap["r_ema"] = r_meas
+            else:
+                a = self.range_ema_alpha
+                ap["r_ema"] = a*r_meas + (1.0-a)*ap["r_ema"]
+            rr_meas = None
+            if ap["r_last"] is not None and ap["r_last_t"] is not None:
+                dt = max(1e-3, t - ap["r_last_t"])
+                rr_inst = (r_meas - ap["r_last"]) / dt
+                if ap["rr_ema"] is None:
+                    ap["rr_ema"] = rr_inst
+                else:
+                    b = self.rr_ema_alpha
+                    ap["rr_ema"] = b*rr_inst + (1.0-b)*ap["rr_ema"]
+                rr_meas = ap["rr_ema"]
+            ap["r_last"] = r_meas; ap["r_last_t"] = t
+
+            # --- EKF update ---
+            ekf = ap["ekf"]
+            speed = fix.get("speed") or 0.0
+            track = fix.get("track")
+            heading_rad = math.radians(track) if track is not None else None
+            if not ekf.is_init():
+                # choose initial azimuth using heading & range-rate if moving
+                if heading_rad is None or speed < 0.2:
+                    h = hashlib.sha1(bssid.encode("utf-8")).digest()
+                    theta0 = ((int.from_bytes(h[:4], "big") % 3600) / 3600.0) * 2*math.pi
+                else:
+                    if rr_meas is None or abs(rr_meas) < self.rr_eps:
+                        sign = 1.0 if (int(bssid.replace(":",""),16) & 1) else -1.0
+                        theta0 = heading_rad + sign*math.pi/2.0
+                    elif rr_meas < 0:
+                        theta0 = heading_rad
+                    else:
+                        theta0 = heading_rad + math.pi
+                x0 = xu + r_meas*math.sin(theta0)
+                y0 = yu + r_meas*math.cos(theta0)
+                pos_std = max(12.0, 0.3*r_meas)
+                ekf.init_from_guess(x0, y0, pos_std=pos_std)
+
+            ekf.predict()
+            sigma_r = self._sigma_r(r_meas, rssi_dbm)
+            ekf.update_range(xu, yu, r_meas, sigma_r)
+
+            if rr_meas is not None and speed >= 0.2 and heading_rad is not None:
+                vx = speed*math.sin(heading_rad)  # x: east
+                vy = speed*math.cos(heading_rad)  # y: north
+                sigma_rr = self._sigma_rr(speed)
+                try:
+                    ekf.update_rdot(xu, yu, vx, vy, rr_meas, sigma_rr)
+                except Exception:
+                    pass
+
+            x_est, y_est = float(ekf.x[0,0]), float(ekf.x[1,0])
+            lat_est, lon_est = xy_to_latlon(x_est, y_est, lat0, lon0)
+            ap["est"] = {"x":x_est,"y":y_est,"lat":lat_est,"lon":lon_est,"rmse":None}
+            ap["last_update"]=now_iso()
+            self._publish_mqtt(bssid, ap)
 
     def _publish_mqtt(self, bssid, ap):
         if self.mqtt is None: return
@@ -245,25 +344,16 @@ class WifiRadar:
         payload={"BSSID":bssid,"SSID":ap.get("ssid"),"RSSI":last.get("rssi"),
                  "Channel":ap.get("last_channel"),"Lat":float(est["lat"]),"Lon":float(est["lon"]),
                  "Alt":(float(last.get("alt")) if last.get("alt") is not None else None),
-                 "RMSE_m":float(est.get("rmse")),"Samples":len(ap["samples"]),
-                 "UpdatedAt":ap.get("last_update")}
+                 "RMSE_m":float(est.get("rmse")) if est.get("rmse") is not None else None,
+                 "Samples":len(ap["samples"]), "UpdatedAt":ap.get("last_update")}
         self.mqtt.publish_ap(bssid, payload)
 
-    def _try_update_estimate(self, bssid, ap):
-        if self.origin is None: return None
-        res=self._estimate_ap(list(ap["samples"]))
-        if not res: return None
-        x,y,rmse=res; lat0,lon0=self.origin; lat,lon=xy_to_latlon(x,y,lat0,lon0)
-        est={"x":float(x),"y":float(y),"lat":float(lat),"lon":float(lon),"rmse":float(rmse)}
-        ap["est"]=est; ap["last_update"]=now_iso(); self._publish_mqtt(bssid, ap); return est
-
     def _write_geojson(self):
-        # Keep logging positions even if an AP is not currently visible.
         if self.origin is None: return
         feats=[]
         with self.lock:
             for bssid, ap in self.aps.items():
-                est = ap.get("est") or self._try_update_estimate(bssid, ap)
+                est = ap.get("est")
                 if not est: continue
                 props={"bssid":bssid,"ssid":ap.get("ssid"),"last_update":ap.get("last_update"),
                        "n_samples":len(ap["samples"]),"rmse_m":est.get("rmse"),
@@ -275,18 +365,24 @@ class WifiRadar:
         with open(tmp,"w",encoding="utf-8") as f: json.dump(fc,f,ensure_ascii=False,indent=2)
         os.replace(tmp,self.out_geojson)
 
-    # ---------- provisional RSSI markers ----------
+    # ---------- azimuth for provisional markers ----------
     def _stable_theta(self, bssid: str) -> float:
         h = hashlib.sha1(bssid.encode("utf-8")).digest()
         val = int.from_bytes(h[:4], "big")
         return (val % 3600) / 3600.0 * 2.0 * math.pi  # 0..2π
 
+    def _provisional_theta(self, bssid:str, speed, heading_rad, rr_ema):
+        if heading_rad is None or speed < 0.2 or rr_ema is None:
+            return self._stable_theta(bssid)
+        if abs(rr_ema) < self.rr_eps:
+            sign = 1.0 if (int(bssid.replace(":",""),16) & 1) else -1.0
+            return heading_rad + sign*math.pi/2.0
+        return heading_rad if rr_ema < 0 else heading_rad + math.pi
+
     def _last_distance(self, bssid: str):
         ap = self.aps.get(bssid)
-        if ap and ap["samples"]:
-            for s in reversed(ap["samples"]):
-                if s.get("dist") is not None:
-                    return float(s["dist"])
+        if ap and ap["r_ema"] is not None:
+            return float(ap["r_ema"])
         s = self.seen.get(bssid)
         if s and s.get("last_rssi") is not None:
             return rssi_to_distance(s["last_rssi"], self.calib["rssi_at_1m"], self.calib["path_loss_n"], self.calib["d0"])
@@ -298,19 +394,15 @@ class WifiRadar:
         last_m = s.get("last_seen_mono")
         if last_m is None: return False
         return (now_mono() - float(last_m)) <= self.prune_age_s
-    # ------------------------------------------------
+    # -----------------------------------------------------
 
     def periodic(self, gps_thread):
         while not self._stop.is_set():
-            with self.lock:
-                for bssid, ap in list(self.aps.items()):
-                    self._try_update_estimate(bssid, ap)
             t=time.time()
             if t - self._last_write >= self.write_period and self.origin is not None:
                 self._write_geojson(); self._last_write=t
             self._gps_fix=gps_thread.get_fix(max_age_s=10.0)
-            time.sleep(0.5)
-
+            time.sleep(0.25)
     def stop(self): self._stop.set()
 
     # ---- GUI in main thread ----
@@ -323,7 +415,7 @@ class WifiRadar:
             print(f"[!] Matplotlib/Tk not available: {e}", file=sys.stderr); return
         self._plt=plt; plt.ion()
         self._radar_fig, self._radar_ax = plt.subplots(subplot_kw={'projection':'polar'})
-        self._radar_ax.set_title("Wi-Fi Radar — estimated (●) vs provisional (⨯)")
+        self._radar_ax.set_title("Wi-Fi Radar — EKF estimates (●) vs provisional (⨯)")
         self._radar_ax.set_ylim(0, self.radar_radius_m); self._radar_ax.grid(True)
         print(f"[i] Matplotlib backend: {plt.get_backend()} DISPLAY={os.environ.get('DISPLAY')}")
         plt.show(block=False)
@@ -335,12 +427,14 @@ class WifiRadar:
         if not fix:
             self._plt.pause(0.01); return
         lat0,lon0=fix["lat"],fix["lon"]
+        speed = fix.get("speed") or 0.0
+        heading_rad = math.radians(fix["track"]) if fix.get("track") is not None else None
 
         est_thetas, est_rs, est_labels = [], [], []
         prov_thetas, prov_rs, prov_labels = [], [], []
 
         with self.lock:
-            # Estimated APs (only show if recently seen)
+            # Estimated APs (EKF); only show if recently seen
             for bssid, ap in self.aps.items():
                 if not self._is_recent(bssid):  # hide when out of range
                     continue
@@ -354,27 +448,25 @@ class WifiRadar:
 
             # Provisional (distance-only) markers (also require recent)
             for bssid, s in self.seen.items():
-                if not self._is_recent(bssid):
-                    continue
+                if not self._is_recent(bssid): continue
                 ap = self.aps.get(bssid)
                 has_est = bool(ap and ap.get("est"))
                 if has_est: continue
                 d = self._last_distance(bssid)
                 if d is None: continue
                 r = min(d, self.radar_radius_m)
-                theta = self._stable_theta(bssid)
+                rr_ema = ap.get("rr_ema") if ap else None
+                theta = self._provisional_theta(bssid, speed, heading_rad, rr_ema)
                 prov_thetas.append(theta); prov_rs.append(r); prov_labels.append(bssid)
 
         ax=self._radar_ax
         ax.clear()
         ax.set_ylim(0, self.radar_radius_m)
-        ax.set_title("Wi-Fi Radar — estimated (●) vs provisional (⨯)")
+        ax.set_title("Wi-Fi Radar — EKF estimates (●) vs provisional (⨯)")
         ax.grid(True)
 
-        if prov_thetas:
-            ax.scatter(prov_thetas, prov_rs, s=25, marker='x')
-        if est_thetas:
-            ax.scatter(est_thetas, est_rs, s=36)
+        if prov_thetas: ax.scatter(prov_thetas, prov_rs, s=25, marker='x')
+        if est_thetas:  ax.scatter(est_thetas,  est_rs,  s=36)
 
         # Label ALL points with BSSID (trim to 17 chars)
         for th, rr, lab in zip(est_thetas, est_rs, est_labels):
@@ -461,8 +553,7 @@ def scapy_sniff_thread(iface, radar: WifiRadar, gps: "GpsThread", stop_evt: thre
                 if not count_without_gps:
                     return
                 return
-            radar.add_observation(bssid=bssid, ssid=ssid, lat=fix["lat"], lon=fix["lon"],
-                                  alt=fix.get("alt"), rssi_dbm=rssi, channel=ch)
+            radar.add_observation(bssid=bssid, ssid=ssid, fix=fix, rssi_dbm=rssi, channel=ch)
         except Exception:
             pass
     try:
@@ -486,7 +577,7 @@ def save_calib(path, rssi_at_1m, path_loss_n, d0):
 
 # ---- Main ----
 def main():
-    ap=argparse.ArgumentParser(description="Wi-Fi Radar: RSSI-filtered view with auto-prune")
+    ap=argparse.ArgumentParser(description="Wi-Fi Radar: EKF trilateration with GPS heading/speed")
     ap.add_argument("--iface", required=True)
     ap.add_argument("--gpsd", default="127.0.0.1:2947")
     ap.add_argument("--out-geojson", default="ap_estimates.geojson")
@@ -503,9 +594,14 @@ def main():
     ap.add_argument("--mqtt-retain", action="store_true")
     ap.add_argument("--show-radar", action="store_true"); ap.add_argument("--radar-radius", type=float, default=120.0)
     ap.add_argument("--count-without-gps", action="store_true", help="Count APs even if GPS fix is missing")
-    # NEW:
+    # filters / prune
     ap.add_argument("--rssi-display-min", type=int, default=-70, help="Accept frames only if RSSI >= this dBm")
     ap.add_argument("--prune-age", type=float, default=20.0, help="Hide APs not seen for this many seconds")
+    # EKF / filters
+    ap.add_argument("--ekf-q", type=float, default=1.0, help="EKF process noise std (m)")
+    ap.add_argument("--range-ema-alpha", type=float, default=0.4, help="EMA alpha for range smoothing [0..1]")
+    ap.add_argument("--rr-ema-alpha", type=float, default=0.5, help="EMA alpha for range-rate smoothing [0..1]")
+    ap.add_argument("--rr-eps", type=float, default=0.12, help="m/s threshold for side-on vs toward/away")
     args=ap.parse_args()
 
     if args.save_calib:
@@ -527,7 +623,8 @@ def main():
                     min_rssi=args.min_rssi, min_samples=args.min_samples, write_period=args.write_period,
                     mqtt_client=mc, show_radar=args.show_radar, radar_radius_m=args.radar_radius,
                     count_without_gps=args.count_without_gps, rssi_display_min=args.rssi_display_min,
-                    prune_age_s=args.prune_age)
+                    prune_age_s=args.prune_age, ekf_q=args.ekf_q, range_ema_alpha=args.range_ema_alpha,
+                    rr_ema_alpha=args.rr_ema_alpha, rr_eps=args.rr_eps)
     radar.start_radar_ui()
 
     stop_evt=threading.Event()
@@ -548,14 +645,13 @@ def main():
             mode_str, age_s, alt = gps.get_status()
             with radar.lock:
                 ap_detected = len(radar.seen)
-                ap_tagged   = sum(1 for a in radar.aps.values() if len(a["samples"]) > 0)
                 ap_est      = sum(1 for a in radar.aps.values() if a.get("est"))
             t=time.time()
             if t-last_print>3.5:
                 gps_part=f"GPS:{mode_str}"
                 if age_s is not None: gps_part+=f" age={age_s}s"
                 if alt is not None: gps_part+=f" alt={alt:.1f}m"
-                print(f"[{now_iso()}] APs detected: {ap_detected} | gps-tagged: {ap_tagged} | estimated: {ap_est} | {gps_part} | geojson: {args.out_geojson}")
+                print(f"[{now_iso()}] APs detected: {ap_detected} | estimated (EKF): {ap_est} | {gps_part} | geojson: {args.out_geojson}")
                 last_print=t
             radar.update_radar_ui()
     except KeyboardInterrupt:
